@@ -1,0 +1,384 @@
+#!/usr/bin/env Rscript
+
+# =============================================================================
+# Bulk RNA‑seq DESeq2 Pipeline (Multi‑dataset, GEO-friendly)
+# -----------------------------------------------------------------------------
+# What this script does
+#   • Downloads sample metadata from GEO for each accession provided
+#   • Loads raw count matrices from local files (various formats supported)
+#   • Harmonizes sample IDs (map from sample titles → GEO accessions)
+#   • Builds a clean colData with consistent factors/covariates
+#   • Runs QC (filtering low counts, VST, PCA)
+#   • Fits DESeq2 designs and writes results + diagnostic plots
+#   • (Optional) ComBat batch correction on VST for visualization only
+#
+# How to use
+#   1) Put this script in your project root (e.g., scripts/ folder)
+#   2) Edit the CONFIG section below: set paths to your local count files and
+#      adjust the column mappings for each dataset (see examples).
+#   3) Run: Rscript bulk_rnaseq_deseq2_pipeline.R
+#
+# Notes
+#   • DESeq2 expects *raw integer counts*. If your file contains FPKM/TPM,
+#     DESeq2 results are not valid. This script will still run but will warn you.
+#   • ComBat is applied (when configured) to VST-expression for PCA/heatmaps only;
+#     do not use ComBat-transformed values for DE testing with DESeq2.
+# =============================================================================
+
+suppressPackageStartupMessages({
+  if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  pkgs <- c("GEOquery", "DESeq2", "sva", "pheatmap", "openxlsx", "data.table", "stringr")
+  to_install <- pkgs[!vapply(pkgs, requireNamespace, FUN.VALUE = logical(1), quietly = TRUE)]
+  if (length(to_install)) BiocManager::install(to_install, ask = FALSE, update = FALSE)
+
+  library(GEOquery)
+  library(DESeq2)
+  library(sva)
+  library(pheatmap)
+  library(openxlsx)
+  library(data.table)
+  library(stringr)
+})
+
+set.seed(123)
+
+# =============================================================================
+# Helpers
+# =============================================================================
+read_counts <- function(path, delim = NULL, header = FALSE, drop_cols_idx = NULL,
+                        first_row_are_sample_ids = TRUE) {
+  # Smart read: uses fread for speed/robustness
+  dt <- tryCatch({
+    if (is.null(delim)) data.table::fread(path, header = header, data.table = FALSE)
+    else data.table::fread(path, header = header, sep = delim, data.table = FALSE)
+  }, error = function(e) stop(sprintf("Failed to read counts at %s: %s", path, e$message)))
+
+  if (!is.null(drop_cols_idx)) {
+    keep <- setdiff(seq_len(ncol(dt)), drop_cols_idx)
+    dt <- dt[, keep, drop = FALSE]
+  }
+
+  # Map header/sample IDs from first row if needed
+  if (isTRUE(first_row_are_sample_ids)) {
+    colnames(dt) <- dt[1, ]
+    dt <- dt[-1, , drop = FALSE]
+  }
+
+  # First column must be gene IDs; move to rownames
+  rownames(dt) <- dt[[1]]
+  dt <- dt[, -1, drop = FALSE]
+
+  # Coerce to numeric matrix (preserve rownames)
+  gene_ids <- rownames(dt)
+  dt[] <- lapply(dt, function(x) suppressWarnings(as.numeric(x)))
+  rownames(dt) <- gene_ids
+
+  as.matrix(dt)
+}
+
+clean_titles <- function(x, patterns_to_remove = NULL) {
+  x <- as.character(x)
+  x <- trimws(x)
+  if (!is.null(patterns_to_remove) && length(patterns_to_remove)) {
+    for (p in patterns_to_remove) x <- gsub(p, "", x, perl = TRUE)
+    x <- trimws(x)
+  }
+  x
+}
+
+geo_metadata <- function(gse_id) {
+  gse <- getGEO(gse_id, GSEMatrix = TRUE, AnnotGPL = TRUE)
+  if (length(gse) < 1) stop(sprintf("No GSEMatrix found for %s", gse_id))
+  pdata <- pData(gse[[1]])
+  pdata
+}
+
+ensure_factor <- function(x, levels = NULL) {
+  x <- as.factor(x)
+  if (!is.null(levels)) x <- factor(x, levels = levels)
+  x
+}
+
+write_results <- function(res, out_dir, prefix) {
+  res_df <- as.data.frame(res)
+  res_sig <- res_df[which(!is.na(res_df$padj) & res_df$padj < 0.05), , drop = FALSE]
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  write.xlsx(res_df, file.path(out_dir, sprintf("%s_all.xlsx", prefix)), rowNames = TRUE)
+  write.xlsx(res_sig, file.path(out_dir, sprintf("%s_padj_lt_0.05.xlsx", prefix)), rowNames = TRUE)
+}
+
+plot_pca_png <- function(vsd, groups, out_path, title = "PCA (VST)") {
+  png(out_path, width = 1200, height = 900, res = 150)
+  print(plotPCA(vsd, intgroup = groups) + ggplot2::ggtitle(title))
+  dev.off()
+}
+
+# =============================================================================
+# CONFIG: declare each dataset you want to process
+#   • name: label used for output folder names
+#   • gse_id: GEO accession (omit or set NA for non-GEO datasets)
+#   • counts_path: local path to counts table
+#   • counts_args: how to parse the counts file
+#   • title_cleaning: regex strings to strip from GEO sample titles
+#   • map_title_to_gsm: set TRUE if your counts column names use sample Titles
+#   • build_coldata: a function(pdata) that returns a clean colData data.frame
+#   • design: DESeq2 design formula
+#   • contrast: c(variable, case, control)
+#   • combat: list(batch = "BatchColumn", mod = ~ Covariates...) or NULL
+# =============================================================================
+
+CONFIG <- list(
+  # -------------------- GSE124326 --------------------
+  list(
+    name = "GSE124326",
+    gse_id = "GSE124326",
+    counts_path = "PATH/TO/GSE124326_count_matrix.txt",   # <- EDIT
+    counts_args = list(delim = "\t", header = FALSE, drop_cols_idx = NULL, first_row_are_sample_ids = TRUE,
+                       postprocess = function(colnames_vec) gsub("\\.counts$", "", colnames_vec)),
+    title_cleaning = NULL,
+    map_title_to_gsm = TRUE,
+    build_coldata = function(pdata) {
+      # Expecting columns like characteristics_ch1, characteristics_ch1.1, etc.
+      cd <- data.frame(
+        row.names = rownames(pdata),
+        Medication = as.character(pdata$characteristics_ch1.3),
+        Sex        = as.character(pdata$characteristics_ch1.2),
+        Age        = as.character(pdata$characteristics_ch1.1),
+        Tobacco    = as.character(pdata$characteristics_ch1.4),
+        Group      = as.character(pdata$characteristics_ch1)
+      )
+      cd$Medication <- gsub("lithium use \\(non-user=0, user = 1\\): ", "", cd$Medication)
+      cd$Medication <- ifelse(cd$Medication %in% c("0", 0), "No", "Yes")
+      cd$Tobacco    <- gsub("tobacco use: ", "", cd$Tobacco)
+      cd$Tobacco    <- ifelse(cd$Tobacco %in% c("0", 0), "No", "Yes")
+      cd$Sex        <- gsub("Sex: ", "", cd$Sex)
+      cd$Age        <- as.numeric(gsub("age: ", "", cd$Age))
+      cd$Group      <- gsub("bipolar disorder diagnosis: ", "", cd$Group)
+      # Impute age with mean if missing
+      cd$Age[is.na(cd$Age)] <- mean(cd$Age, na.rm = TRUE)
+
+      cd$Medication <- ensure_factor(cd$Medication)
+      cd$Tobacco    <- ensure_factor(cd$Tobacco)
+      cd$Sex        <- ensure_factor(cd$Sex)
+      cd$Group      <- ensure_factor(cd$Group, levels = c("Control", "BP1", "BP2"))
+      cd
+    },
+    design = ~ Tobacco + Medication + Age + Sex + Group,
+    contrast = c("Group", "BP1", "Control"),
+    combat = NULL
+  ),
+
+  # -------------------- GSE263180 --------------------
+  list(
+    name = "GSE263180",
+    gse_id = "GSE263180",
+    counts_path = "PATH/TO/GSE263180_raw_counts.txt",     # <- EDIT
+    counts_args = list(delim = "\t", header = FALSE, drop_cols_idx = 30, first_row_are_sample_ids = TRUE),
+    title_cleaning = c(", Schizophrenia$", ", Control$"),
+    map_title_to_gsm = TRUE,
+    build_coldata = function(pdata) {
+      grp <- pdata[["disease:ch1"]]
+      cd <- data.frame(row.names = rownames(pdata), Group = ensure_factor(grp, levels = c("healthy control", "Schizophrenia")))
+      cd
+    },
+    design = ~ Group,
+    contrast = c("Group", "Schizophrenia", "healthy control"),
+    combat = NULL
+  ),
+
+  # -------------------- GSE247998 --------------------
+  list(
+    name = "GSE247998",
+    gse_id = "GSE247998",
+    counts_path = "PATH/TO/GSE247998_JJM_count_matrix.csv.gz",   # <- EDIT
+    counts_args = list(delim = ",", header = FALSE, drop_cols_idx = NULL, first_row_are_sample_ids = TRUE),
+    title_cleaning = NULL,
+    map_title_to_gsm = TRUE,
+    build_coldata = function(pdata) {
+      cd <- data.frame(
+        row.names = rownames(pdata),
+        Suicide = ensure_factor(pdata[["suicide attempt:ch1"]]),
+        SI      = ensure_factor(pdata[["si group:ch1"]]),
+        Sex     = ensure_factor(pdata[["Sex:ch1"]]),
+        Age     = suppressWarnings(as.numeric(pdata[["age:ch1"]])),
+        Group   = ensure_factor(pdata[["diagnosis:ch1"]], levels = c("Healthy control", "MDD"))
+      )
+      cd$Age[is.na(cd$Age)] <- mean(cd$Age, na.rm = TRUE)
+      cd
+    },
+    design = ~ SI + Suicide + Age + Sex + Group,
+    contrast = c("Group", "MDD", "Healthy control"),
+    combat = NULL
+  ),
+
+  # -------------------- GSE190518 (WARNING: FPKM, not counts) --------------------
+  list(
+    name = "GSE190518",
+    gse_id = "GSE190518",
+    counts_path = "PATH/TO/GSE190518_mRNA.count.fpkm.txt",  # <- EDIT (FPKM!)
+    counts_args = list(delim = "\t", header = FALSE, drop_cols_idx = 2, first_row_are_sample_ids = TRUE),
+    title_cleaning = NULL,
+    map_title_to_gsm = TRUE,
+    build_coldata = function(pdata) {
+      grp <- pdata[["disease state:ch1"]]
+      data.frame(row.names = rownames(pdata), Group = ensure_factor(grp, levels = c("healthy controls", "major depressive disorder patients")))
+    },
+    design = ~ Group,
+    contrast = c("Group", "major depressive disorder patients", "healthy controls"),
+    combat = NULL,
+    is_fpkm = TRUE
+  ),
+
+  # -------------------- Le Trang (no GEO) --------------------
+  list(
+    name = "Trang_30185774",
+    gse_id = NA,  # no GEO metadata
+    counts_path = "PATH/TO/Counts_PMID_Trang_rnaseq.tab",  # <- EDIT
+    counts_args = list(delim = "\t", header = TRUE, drop_cols_idx = NULL, first_row_are_sample_ids = FALSE),
+    title_cleaning = NULL,
+    map_title_to_gsm = FALSE,
+    custom_metadata_path = "PATH/TO/metadata_PMID_Trang.xlsx",  # <- EDIT
+    build_coldata = function(pdata) {
+      # pdata here is the read Excel metadata
+      cd <- data.frame(
+        row.names = pdata$ID,
+        Batch = ensure_factor(pdata$batch),
+        Sex   = ensure_factor(pdata$sex),
+        Age   = suppressWarnings(as.numeric(pdata$age)),
+        Group = ensure_factor(pdata$Diagnostico, levels = c("Control", "MDD"))
+      )
+      cd$Age[is.na(cd$Age)] <- mean(cd$Age, na.rm = TRUE)
+      cd
+    },
+    design = ~ Batch + Age + Sex + Group,
+    contrast = c("Group", "MDD", "Control"),
+    combat = list(batch = "Batch", mod = ~ Age + Sex + Group)
+  )
+)
+
+# =============================================================================
+# Core processing
+# =============================================================================
+process_dataset <- function(cfg, out_root = "outputs") {
+  message("\n============================================================")
+  message(sprintf("Processing: %s", cfg$name))
+  message("============================================================\n")
+
+  out_dir <- file.path(out_root, cfg$name)
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # 1) Load metadata (GEO or custom)
+  if (is.na(cfg$gse_id)) {
+    if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
+    metadata <- readxl::read_excel(cfg$custom_metadata_path)
+    pdata <- metadata
+  } else {
+    pdata <- geo_metadata(cfg$gse_id)
+  }
+
+  # 2) Read counts
+  counts <- do.call(read_counts, c(list(path = cfg$counts_path), cfg$counts_args))
+
+  # 3) Optional: post-process column names from first row (e.g., strip ".counts")
+  if (!is.null(cfg$counts_args$postprocess) && !is.na(cfg$counts_args$postprocess)) {
+    colnames(counts) <- cfg$counts_args$postprocess(colnames(counts))
+  }
+
+  # 4) Map sample Titles → GEO accessions (if needed)
+  if (isTRUE(cfg$map_title_to_gsm)) {
+    titles <- if ("title" %in% colnames(pdata)) as.character(pdata$title) else stop("GEO pdata lacks 'title' column")
+    if (!is.null(cfg$title_cleaning)) titles <- clean_titles(titles, cfg$title_cleaning)
+    id_map <- setNames(pdata$geo_accession, titles)
+
+    # Counts columns must match the cleaned Titles
+    cur_ids <- colnames(counts)
+    new_ids <- unname(id_map[cur_ids])
+    if (any(is.na(new_ids))) {
+      missing <- cur_ids[is.na(new_ids)]
+      stop(sprintf("Could not map %d count columns to GEO accessions via title: %s", length(missing), paste(missing, collapse = ", ")))
+    }
+    colnames(counts) <- new_ids
+  }
+
+  # 5) Build colData
+  colData <- cfg$build_coldata(pdata)
+
+  # 6) Sanity checks
+  if (!all(colnames(counts) %in% rownames(colData))) {
+    stop("Some count columns do not match colData rownames. Check your ID mapping.")
+  }
+  # Reorder colData to counts columns order
+  colData <- colData[colnames(counts), , drop = FALSE]
+
+  # 7) Create DESeqDataSet
+  if (isTRUE(cfg$is_fpkm)) {
+    warning(sprintf("%s: Input appears to be FPKM/TPM. DESeq2 requires raw counts. Results are NOT valid for differential testing.", cfg$name))
+  }
+
+  dds <- DESeqDataSetFromMatrix(countData = round(counts), colData = colData, design = cfg$design)
+
+  # Filter low counts
+  keep <- rowSums(counts(dds)) > 10
+  dds <- dds[keep, ]
+
+  # Size factors
+  dds <- estimateSizeFactors(dds)
+
+  # VST
+  vsd <- vst(dds, blind = FALSE)
+
+  # Optional: ComBat on VST (viz only)
+  if (!is.null(cfg$combat)) {
+    batch_col <- cfg$combat$batch
+    if (!batch_col %in% colnames(colData)) stop(sprintf("Combat batch column '%s' not in colData", batch_col))
+    mod <- model.matrix(cfg$combat$mod, data = as.data.frame(colData))
+    assay(vsd) <- ComBat(dat = assay(vsd), batch = colData[[batch_col]], mod = mod)
+  }
+
+  # PCA plots
+  pca_groups <- intersect(c("Group", "Sex", "Batch"), colnames(colData))
+  if (length(pca_groups) == 0) pca_groups <- colnames(colData)[1]
+  plot_pca_png(vsd, groups = pca_groups, out_path = file.path(out_dir, "pca_vst.png"),
+               title = sprintf("%s: PCA (VST)", cfg$name))
+
+  # 8) DESeq2 model
+  dds <- DESeq(dds)
+  message("Coefficients in model:")
+  message(paste(resultsNames(dds), collapse = ", "))
+
+  # 9) Results (contrast)
+  res <- results(dds, contrast = cfg$contrast)
+  summary(res)
+
+  # 10) Write results
+  prefix <- sprintf("%s_vs_%s", cfg$contrast[2], cfg$contrast[3])
+  write_results(res, out_dir, prefix)
+
+  # 11) Optional: Heatmap of top 50 (if enough genes)
+  top_idx <- head(order(res$padj, na.last = NA), 50)
+  if (length(top_idx) > 5) {
+    png(file.path(out_dir, "heatmap_top50.png"), width = 1400, height = 1200, res = 150)
+    ann <- as.data.frame(colData[, pca_groups, drop = FALSE])
+    pheatmap(assay(vsd)[top_idx, ], cluster_rows = TRUE, cluster_cols = TRUE, annotation_col = ann, show_rownames = TRUE)
+    dev.off()
+  }
+
+  invisible(list(dds = dds, vsd = vsd, res = res, colData = colData))
+}
+
+# =============================================================================
+# Run all datasets in CONFIG
+# =============================================================================
+
+# ---- EDIT THESE before running ----
+# Replace all "PATH/TO/..." with your actual local file paths.
+# -----------------------------------
+
+results <- lapply(CONFIG, function(cfg) {
+  tryCatch(process_dataset(cfg), error = function(e) {
+    message(sprintf("[ERROR] %s: %s", cfg$name, e$message))
+    NULL
+  })
+})
+
+message("\nAll done. Check the 'outputs/' folder for per-dataset results and plots.\n")
