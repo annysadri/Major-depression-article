@@ -1,0 +1,82 @@
+#!/usr/bin/env Rscript
+
+# =============================================================================
+# LDA Pipeline 
+# -----------------------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(MASS)
+  library(caret)
+  library(openxlsx)
+  library(ggplot2)
+  library(dplyr)
+})
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+run_pca_lda <- function(df, groups, pc_n = 10, train_frac = 0.7, seed = 123) {
+  set.seed(seed)
+  idx <- caret::createDataPartition(groups, p = train_frac, list = FALSE)
+  train <- df[idx, , drop = FALSE]
+  test  <- df[-idx, , drop = FALSE]
+  g_train <- groups[idx]
+  g_test  <- groups[-idx]
+
+  pca <- prcomp(train, center = TRUE, scale. = TRUE)
+  k <- min(pc_n, ncol(pca$x))
+  train_pca <- data.frame(pca$x[, 1:k, drop = FALSE], Groups = g_train)
+  test_pca  <- data.frame(predict(pca, test)[, 1:k, drop = FALSE], Groups = g_test)
+
+  lda_fit <- MASS::lda(Groups ~ ., data = train_pca)
+
+  pc_rot <- pca$rotation[, 1:k, drop = FALSE]
+  lda_coef <- lda_fit$scaling[rownames(pc_rot), 1, drop = TRUE]
+  gene_contrib <- pc_rot %*% lda_coef
+  gene_rank <- data.frame(Gene = rownames(pc_rot), LD1_Contribution = as.vector(gene_contrib))
+  gene_rank <- gene_rank[order(abs(gene_rank$LD1_Contribution), decreasing = TRUE), , drop = FALSE]
+
+  list(lda = lda_fit, train_pca = train_pca, test_pca = test_pca, gene_rank = gene_rank)
+}
+
+plot_ld1_density <- function(lda_fit, df_pca, title) {
+  ld1 <- predict(lda_fit, df_pca)$x[, 1]
+  df <- data.frame(LD1 = ld1, Groups = df_pca$Groups)
+  ggplot(df, aes(x = LD1, fill = Groups)) +
+    geom_density(alpha = 0.6) +
+    scale_fill_manual(values = c("MDD" = "indianred", "Control" = "#2E5077")) +
+    theme_bw() +
+    ggtitle(title) +
+    xlab("LD1 Coefficient")
+}
+
+plot_contrib <- function(gene_rank, title) {
+  df <- gene_rank %>%
+    arrange(desc(LD1_Contribution)) %>%
+    mutate(Gene = factor(Gene, levels = rev(Gene)), Direction = ifelse(LD1_Contribution > 0, "Positive", "Negative"))
+  ggplot(df, aes(x = LD1_Contribution, y = Gene, color = Direction)) +
+    geom_segment(aes(x = 0, xend = LD1_Contribution, y = Gene, yend = Gene), linewidth = 0.7) +
+    geom_point(size = 3) +
+    scale_color_manual(values = c("Positive" = "indianred", "Negative" = "#2E5077")) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+    labs(x = "LD1 Coefficient", y = "Genes", title = title) +
+    theme_bw()
+}
+
+# Load count matrices + metadata for Cathomas and Trang before running
+
+# cathomas_res <- run_pca_lda(cathomas_counts, cathomas_groups)
+# trang_res <- run_pca_lda(trang_counts, trang_groups)
+
+# ggsave(plot = plot_ld1_density(cathomas_res$lda, cathomas_res$train_pca, "Cathomas"), filename = "cathomas_density.tiff")
+# ggsave(plot = plot_contrib(cathomas_res$gene_rank, "Cathomas"), filename = "cathomas_contributions.tiff")
+
+# ggsave(plot = plot_ld1_density(trang_res$lda, trang_res$train_pca, "Trang"), filename = "trang_density.tiff")
+# ggsave(plot = plot_contrib(trang_res$gene_rank, "Trang"), filename = "trang_contributions.tiff")
+
+# Shared genes
+# shared <- intersect(cathomas_res$gene_rank$Gene, trang_res$gene_rank$Gene)
+# write.xlsx(list(Cathomas = cathomas_res$gene_rank, Trang = trang_res$gene_rank, Shared = shared), "lda_shared_genes.xlsx")
+
+message("Simplified LDA analysis complete.")
