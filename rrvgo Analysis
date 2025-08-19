@@ -1,0 +1,86 @@
+#!/usr/bin/env Rscript
+
+# =============================================================================
+# rrvgo Analysis Pipeline
+# -----------------------------------------------------------------------------
+# What this script does:
+#   • Loads enrichment tables (upregulated and downregulated)
+#   • Merges tables into a single input
+#   • Extracts GO IDs from terms
+#   • Calculates similarity matrix and reduces GO terms with rrvgo
+#   • Generates and saves heatmaps
+#   • Allows selection of specific biological processes for focused analysis
+#
+# How to use:
+#   1) Place your enrichment Excel files in the working directory
+#   2) Update file paths below if necessary
+#   3) Run: Rscript rrvgo_synapse_analysis.R
+# =============================================================================
+
+suppressPackageStartupMessages({
+  if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  if (!requireNamespace("rrvgo", quietly = TRUE)) BiocManager::install("rrvgo")
+
+  library(readxl)
+  library(openxlsx)
+  library(rrvgo)
+  library(stringr)
+  library(dplyr)
+  library(ggplot2)
+})
+
+# =============================================================================
+# Load enrichment tables (adjust file names if needed)
+# =============================================================================
+
+down_enrich <- read_excel("down_enrich_1.xlsx", sheet = 2)
+up_enrich   <- read_excel("up_enrich_1.xlsx", sheet = 2)
+
+colnames(down_enrich)[2] <- "Systems"
+both <- rbind(down_enrich, up_enrich)
+write.xlsx(both, "input_merge_up_down.xlsx")
+
+# =============================================================================
+# Extract GO IDs
+# =============================================================================
+
+both <- both %>%
+  mutate(ID = str_extract(Term, "\\(GO:[^)]+\\)")) %>%
+  mutate(ID = str_replace_all(ID, "[()]+", ""))
+
+# =============================================================================
+# Similarity matrix and term reduction
+# =============================================================================
+
+simMatrix <- calculateSimMatrix(both$ID,
+                                orgdb = "org.Hs.eg.db",
+                                ont = "BP",
+                                method = "Rel")
+write.xlsx(simMatrix, "simMatrix_all.xlsx")
+
+scores <- setNames(-log10(both$P.value), both$ID)
+
+reducedTerms <- reduceSimMatrix(simMatrix,
+                                scores,
+                                threshold = 0.7,
+                                orgdb = "org.Hs.eg.db")
+
+write.xlsx(reducedTerms, "reducedTerms_all.xlsx")
+
+# =============================================================================
+# Heatmap for all terms
+# =============================================================================
+
+color_scale <- colorRampPalette(c("#0077b6", "white", "brown2"))(100)
+
+p <- heatmapPlot(simMatrix,
+                 reducedTerms,
+                 annotateParent = TRUE,
+                 annotationLabel = "parentTerm",
+                 fontsize = 10,
+                 col = color_scale)
+
+ggsave("heatmap_rrvgo_all.tiff", plot = p, device = "tiff", width = 30, height = 20)
+
+
+message("rrvgo analysis complete. Check the output files in your working directory.")
