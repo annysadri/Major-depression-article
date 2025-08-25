@@ -1,0 +1,271 @@
+# synapse_enrichr_pipeline.R
+# ------------------------------------------------------------
+# Discover synapse-related genes via Enrichr, filter your DEG
+# table accordingly, export tidy results to a multi-sheet Excel,
+# and plot up/down frequencies.
+#
+# Author: Anny Adri
+# ------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  req_pkgs <- c("enrichR", "dplyr", "tidyr", "stringr",
+                "openxlsx", "readxl", "readr", "ggplot2", "tools")
+  to_install <- setdiff(req_pkgs, rownames(installed.packages()))
+  if (length(to_install)) install.packages(to_install, dependencies = TRUE)
+  lapply(req_pkgs, require, character.only = TRUE)
+})
+
+# ----------------------------- #
+# Helpers
+# ----------------------------- #
+
+#' Read a table of genes (auto-detect CSV/XLSX)
+#' Expected columns (case-insensitive): Genes (required), metap (optional), metafc (optional)
+read_sig_table <- function(path) {
+  stopifnot(file.exists(path))
+  ext <- tolower(file_ext(path))
+  df <- switch(
+    ext,
+    "xlsx" = readxl::read_excel(path),
+    "xls"  = readxl::read_excel(path),
+    "csv"  = readr::read_csv(path, show_col_types = FALSE),
+    stop("Unsupported file extension: ", ext)
+  )
+
+  # Standardize column names (lower snake)
+  names(df) <- names(df) |>
+    stringr::str_replace_all("\\s+", "_") |>
+    tolower()
+
+  # Try to map common variants to canonical names
+  col_map <- list(
+    genes = c("genes", "gene", "symbol", "gene_symbol"),
+    metap = c("metap", "meta_p", "pmeta", "p_meta"),
+    metafc = c("metafc", "meta_fc", "fcmeta", "logfc", "foldchange", "fold_change")
+  )
+
+  pick_col <- function(candidates) {
+    hit <- intersect(candidates, names(df))
+    if (length(hit)) hit[1] else NA_character_
+  }
+
+  gene_col  <- pick_col(col_map$genes)
+  metap_col <- pick_col(col_map$metap)
+  metafc_col<- pick_col(col_map$metafc)
+
+  if (is.na(gene_col)) stop("Could not find a 'Genes' column (e.g., Genes/Gene/Symbol).")
+
+  out <- dplyr::tibble(
+    Genes  = df[[gene_col]] |> as.character(),
+    metap  = if (!is.na(metap_col))  suppressWarnings(as.numeric(df[[metap_col]]))  else NA_real_,
+    metafc = if (!is.na(metafc_col)) suppressWarnings(as.numeric(df[[metafc_col]])) else NA_real_
+  ) |>
+    dplyr::distinct(Genes, .keep_all = TRUE) |>
+    dplyr::filter(!is.na(Genes) & Genes != "")
+
+  out
+}
+
+#' Get the Enrichr libraries you want, keeping only those actually available.
+get_valid_enrichr_libs <- function(preferred_libs = c(
+  "GO_Biological_Process_2025", "GO_Cellular_Component_2025", "GO_Molecular_Function_2025",
+  "SynGO_2024", "KEGG_2021_Human", "WikiPathways_2024_Human",
+  "Reactome_Pathways_2024", "MSigDB_Hallmark_2024",
+  "Human_Phenotype_Ontology", "Jensen_COMPARTMENTS"
+)) {
+  libs <- tryCatch(enrichR::listEnrichrDbs()$libraryName,
+                   error = function(e) character())
+  valid <- intersect(preferred_libs, libs)
+  if (!length(valid))
+    stop("No preferred Enrichr libraries are currently available. Try updating 'preferred_libs'.")
+  valid
+}
+
+#' Query Enrichr and collect genes from terms matching a keyword (default: "synap")
+#' @param genes character vector of gene symbols
+#' @param libraries character vector of Enrichr libraries
+#' @param term_pattern regex for term filtering (case-insensitive)
+#' @param min_databases keep genes that appear in >= this many libraries
+#' @param keep_padj_only if TRUE, keep only terms with Adjusted.P.value <= padj_max
+#' @param padj_max numeric cutoff for adjusted P (used if keep_padj_only = TRUE)
+enrich_and_collect_genes <- function(
+  genes,
+  libraries,
+  term_pattern = "synap",
+  min_databases = 2,
+  keep_padj_only = FALSE,
+  padj_max = 0.05
+) {
+  term_regex <- stringr::regex(term_pattern, ignore_case = TRUE)
+
+  gene_hits <- tibble::tibble(Gene = character(), Library = character())
+  sheets <- list()
+
+  for (lib in libraries) {
+    message("Querying: ", lib)
+    enr <- tryCatch(enrichR::enrichr(genes, database = lib),
+                    error = function(e) NULL)
+    if (is.null(enr) || !(lib %in% names(enr))) next
+
+    res <- enr[[lib]]
+    if (!nrow(res)) next
+
+    # Filter by term and (optionally) adjusted P
+    res_f <- res |>
+      dplyr::filter(stringr::str_detect(.data$Term, term_regex)) |>
+      { if (keep_padj_only && "Adjusted.P.value" %in% names(.)) dplyr::filter(., .data$Adjusted.P.value <= padj_max) else . } |>
+      dplyr::select(Term, Genes, dplyr::any_of(c("Adjusted.P.value", "P.value", "Combined.Score"))) |>
+      tidyr::separate_rows(Genes, sep = ";") |>
+      dplyr::mutate(
+        Genes = stringr::str_trim(Genes),
+        Library = lib
+      ) |>
+      dplyr::distinct()
+
+    if (!nrow(res_f)) next
+
+    gene_hits <- dplyr::bind_rows(gene_hits,
+                                  res_f |>
+                                    dplyr::select(Gene = Genes, Library))
+
+    # Keep a per-library sheet
+    colnames(res_f) <- sub("\\.", "_", colnames(res_f))
+    sheets[[lib]] <- res_f |>
+      dplyr::rename(Adj_P = dplyr::any_of("Adjusted_P_value"),
+                    P = dplyr::any_of("P_value"),
+                    Combined_Score = dplyr::any_of("Combined_Score"))
+  }
+
+  # Summarize cross-library presence
+  summary <- gene_hits |>
+    dplyr::distinct(Gene, Library) |>
+    dplyr::count(Gene, name = "Num_Libraries") |>
+    dplyr::filter(.data$Num_Libraries >= min_databases) |>
+    dplyr::arrange(dplyr::desc(.data$Num_Libraries))
+
+  sheets[["Synaptic_Genes_Summary"]] <- summary
+  list(summary = summary, sheets = sheets)
+}
+
+#' Filter the DEG table to synapse genes and export
+export_results <- function(sig_df, syn_genes_df, out_xlsx = "synapse_enrichr_results.xlsx") {
+  syn_genes <- unique(syn_genes_df$Gene)
+  filtered <- sig_df |>
+    dplyr::filter(.data$Genes %in% syn_genes) |>
+    dplyr::select(dplyr::any_of(c("Genes", "metap", "metafc")))
+
+  wb_list <- list(
+    Synaptic_DEGs = filtered
+  )
+  # If caller passed extra sheets from enrichment, append them:
+  wb_list <- c(wb_list, attr(syn_genes_df, "sheets"))
+
+  # Fallback if attr missing:
+  if (is.null(wb_list$Synaptic_Genes_Summary) && nrow(syn_genes_df)) {
+    wb_list$Synaptic_Genes_Summary <- syn_genes_df
+  }
+
+  openxlsx::write.xlsx(wb_list, out_xlsx, rowNames = FALSE)
+  invisible(filtered)
+}
+
+#' Plot frequency of up/down-regulated genes (using metafc > 0 as "up")
+plot_up_down <- function(filtered_df,
+                         outfile = "DEGs_up_down_barplot.tiff",
+                         width = 4, height = 4, dpi = 400) {
+  if (!all(c("Genes", "metafc") %in% names(filtered_df))) {
+    warning("Skipping plot: 'metafc' not present in filtered table.")
+    return(invisible(NULL))
+  }
+
+  df_plot <- filtered_df |>
+    dplyr::mutate(Regulation = ifelse(.data$metafc > 0, "up-regulated", "down-regulated")) |>
+    dplyr::count(Regulation)
+
+  p <- ggplot2::ggplot(df_plot, ggplot2::aes(x = Regulation, y = n, fill = Regulation)) +
+    ggplot2::geom_bar(stat = "identity") +
+    ggplot2::geom_text(ggplot2::aes(label = n), vjust = -0.5, size = 4) +
+    ggplot2::labs(x = "DEGs", y = "Number of DEGs") +
+    ggplot2::theme_bw() +
+    ggplot2::ylim(0, max(df_plot$n) * 1.15) +
+    ggplot2::scale_fill_manual(values = c("up-regulated" = "indianred2",
+                                          "down-regulated" = "steelblue3")) +
+    ggplot2::theme(
+      legend.position = "none",
+      panel.grid.major = ggplot2::element_blank(),
+      panel.grid.minor = ggplot2::element_blank(),
+      axis.title.x = ggplot2::element_text(size = 12),
+      axis.title.y = ggplot2::element_text(size = 12),
+      axis.text.x  = ggplot2::element_text(size = 11, angle = 30, hjust = 1),
+      axis.text.y  = ggplot2::element_text(size = 11)
+    )
+
+  print(p)
+  ggplot2::ggsave(outfile, plot = p, width = width, height = height, dpi = dpi)
+  invisible(p)
+}
+
+# ----------------------------- #
+# Main entry point
+# ----------------------------- #
+
+#' Run the pipeline end-to-end
+#' @param sig_path path to your DEG/significance table
+#' @param out_xlsx name of the Excel export (multi-sheet)
+#' @param preferred_libs Enrichr libraries to try
+#' @param term_pattern regex for term filter (e.g., "synap" matches synapse, synaptic...)
+#' @param min_databases retain genes present in >= this many libraries
+#' @param keep_padj_only filter by adjusted P when available
+#' @param padj_max cutoff for adjusted P (if keep_padj_only = TRUE)
+run_synapse_pipeline <- function(
+  sig_path,
+  out_xlsx = "synapse_enrichr_results.xlsx",
+  preferred_libs = c(
+    "GO_Biological_Process_2025", "GO_Cellular_Component_2025", "GO_Molecular_Function_2025",
+    "SynGO_2024", "KEGG_2021_Human", "WikiPathways_2024_Human",
+    "Reactome_Pathways_2024", "MSigDB_Hallmark_2024",
+    "Human_Phenotype_Ontology", "Jensen_COMPARTMENTS"
+  ),
+  term_pattern = "synap",
+  min_databases = 2,
+  keep_padj_only = FALSE,
+  padj_max = 0.05
+) {
+  sig <- read_sig_table(sig_path)
+
+  valid_libs <- get_valid_enrichr_libs(preferred_libs)
+  enr <- enrich_and_collect_genes(
+    genes = sig$Genes,
+    libraries = valid_libs,
+    term_pattern = term_pattern,
+    min_databases = min_databases,
+    keep_padj_only = keep_padj_only,
+    padj_max = padj_max
+  )
+
+  # Attach per-library sheets as an attribute so export_results can bundle them
+  attr(enr$summary, "sheets") <- enr$sheets
+
+  filtered <- export_results(sig, enr$summary, out_xlsx = out_xlsx)
+  plot_up_down(filtered, outfile = "DEGs_up_down_barplot.tiff")
+
+  invisible(list(
+    libraries_used = valid_libs,
+    synaptic_genes_summary = enr$summary,
+    filtered_table = filtered,
+    excel_file = out_xlsx,
+    barplot_file = "DEGs_up_down_barplot.tiff"
+  ))
+}
+
+# ----------------------------- #
+# Example usage (uncomment and edit)
+# ----------------------------- #
+# result <- run_synapse_pipeline(
+#   sig_path = "path/to/sig_notconverted.xlsx",   # or .csv
+#   out_xlsx = "synapse_enrichr_results.xlsx",
+#   term_pattern = "synap",        # change to another regex if you want a different theme
+#   min_databases = 2,             # 1 = more permissive, >2 = more stringent
+#   keep_padj_only = FALSE,        # set TRUE to keep only significant terms (when available)
+#   padj_max = 0.05
+# )
